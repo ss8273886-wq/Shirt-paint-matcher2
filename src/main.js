@@ -1,79 +1,63 @@
 import { createClient } from "@supabase/supabase-js";
 import "./style.css";
 
-const config = {
-  url: import.meta.env.VITE_SUPABASE_URL,
-  key: import.meta.env.VITE_SUPABASE_ANON_KEY,
-};
-const configured = Boolean(config.url && config.key);
-const supabase = configured ? createClient(config.url, config.key) : null;
+const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL;
+const SUPABASE_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY;
+const TABLE = "shared_matcher_data";
+const ROW_ID = 1;
+
 const app = document.querySelector("#app");
+const supabase = SUPABASE_URL && SUPABASE_KEY
+  ? createClient(SUPABASE_URL, SUPABASE_KEY)
+  : null;
+
+let data = { pants: [""], shirts: [""] };
+let saveTimer;
+let saving = false;
+let dirty = false;
+let remoteChannel;
 
 const escapeHtml = (value) => String(value).replace(/[&<>"']/g, (char) => ({
   "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
 }[char]));
 
-function renderLogin(message = "") {
-  app.innerHTML = `
-    <main class="auth-shell">
-      <section class="auth-card">
-        <div class="eyebrow">Private cloud matcher</div>
-        <h1>Shirt & Pant Matcher</h1>
-        <p class="muted">Sign in with your email. Your list will sync across your devices.</p>
-        ${message ? `<p class="notice" role="status">${escapeHtml(message)}</p>` : ""}
-        <form id="login-form">
-          <label for="email">Email address</label>
-          <input id="email" name="email" type="email" autocomplete="email"
-                 placeholder="you@example.com" maxlength="254" required />
-          <button class="primary" type="submit">Send sign-in link</button>
-        </form>
-        <p class="tiny">We will email you a secure sign-in link. No password needed.</p>
-      </section>
-    </main>`;
-
-  document.querySelector("#login-form").addEventListener("submit", async (event) => {
-    event.preventDefault();
-    const button = event.currentTarget.querySelector("button");
-    const email = new FormData(event.currentTarget).get("email").trim().toLowerCase();
-    if (!email || email.length > 254) return;
-    button.disabled = true;
-    button.textContent = "Sending…";
-    const { error } = await supabase.auth.signInWithOtp({
-      email,
-      options: { emailRedirectTo: window.location.origin },
-    });
-    renderLogin(error ? `Could not send link: ${error.message}` : "Check your email for the secure sign-in link.");
-  });
+function normalizeRows(values) {
+  const rows = Array.isArray(values)
+    ? values.filter((value) => typeof value === "string").map((value) => value.slice(0, 24)).slice(0, 500)
+    : [];
+  while (rows.length && !rows[rows.length - 1].trim()) rows.pop();
+  return [...rows, ""];
 }
 
-function renderMatcher(user, initialData) {
-  let data = {
-    pants: Array.isArray(initialData?.pants) ? initialData.pants : [""],
-    shirts: Array.isArray(initialData?.shirts) ? initialData.shirts : [""],
+function snapshot() {
+  return {
+    pants: data.pants.filter((value) => value.trim()),
+    shirts: data.shirts.filter((value) => value.trim()),
   };
-  data.pants = normalizeRows(data.pants);
-  data.shirts = normalizeRows(data.shirts);
+}
 
-  let saveTimer;
-  let saving = false;
-  let dirty = false;
-  let lastSavedSnapshot = JSON.stringify(data);
-  let remoteChannel;
+function setStatus(message, state = "") {
+  const status = document.querySelector("#save-state");
+  if (!status) return;
+  status.textContent = message;
+  status.dataset.state = state;
+}
 
+function render() {
   app.innerHTML = `
     <main class="shell">
       <header class="topbar">
         <div>
-          <div class="eyebrow">Private cloud matcher</div>
+          <div class="eyebrow">Shared inventory matcher</div>
           <h1>Shirt & Pant Matcher</h1>
-          <p class="muted">Signed in as ${escapeHtml(user.email || "your account")}</p>
+          <p class="muted">Everyone using this link sees and edits the same list.</p>
         </div>
-        <button id="signout" class="quiet" type="button">Sign out</button>
+        <span class="shared-label">Shared</span>
       </header>
 
       <section class="summary" aria-live="polite">
         <div><strong id="match-count">0</strong><span>matching pair(s)</span></div>
-        <div class="save-state" id="save-state">Loading saved list…</div>
+        <div class="save-state" id="save-state">Connecting to cloud…</div>
       </section>
 
       <section class="columns">
@@ -92,152 +76,163 @@ function renderMatcher(user, initialData) {
       </section>
 
       <section class="results">
-        <h2>Matched pairs</h2>
+        <div class="results-heading">
+          <h2>Matched pairs</h2>
+          <button id="pack-matches" class="pack-button" type="button" disabled>✓ Packed — remove matches</button>
+        </div>
+        <p class="hint">After you pack matched items, use the button to remove those numbers from both lists.</p>
         <div id="pairs" class="empty">No matches yet.</div>
       </section>
       <div class="actions">
-        <button id="clear" class="danger" type="button">Clear all</button>
+        <button id="clear" class="danger" type="button">Clear all shared data</button>
       </div>
-      <p class="tiny center">Your list is private to this account and saved in the cloud.</p>
+      <p class="tiny center">Shared public list: anyone with this website link can view, add, edit, or remove entries.</p>
     </main>`;
 
-  const listElement = (group) => document.getElementById(`${group}-list`);
+  renderRows("pants");
+  renderRows("shirts");
+  updateMatches();
+  bindActions();
+}
 
-  function normalizeRows(rows) {
-    const safe = rows
-      .filter((value) => typeof value === "string")
-      .map((value) => value.slice(0, 24));
-    while (safe.length && safe[safe.length - 1] === "") safe.pop();
-    return [...safe, ""];
-  }
+function renderRows(group) {
+  const container = document.getElementById(`${group}-list`);
+  if (!container) return;
+  container.replaceChildren();
 
-  function setSaveState(text, state = "") {
-    const element = document.querySelector("#save-state");
-    if (!element) return;
-    element.textContent = text;
-    element.dataset.state = state;
-  }
+  data[group].forEach((value, index) => {
+    const row = document.createElement("div");
+    row.className = "item";
+    row.dataset.group = group;
+    row.dataset.index = String(index);
 
-  function renderRows(group) {
-    const container = listElement(group);
-    container.replaceChildren();
-    data[group].forEach((value, index) => {
-      const row = document.createElement("div");
-      row.className = "item";
-      row.dataset.group = group;
-      row.dataset.index = String(index);
+    const label = document.createElement("label");
+    label.htmlFor = `${group}-${index}`;
+    label.textContent = String(index + 1);
 
-      const label = document.createElement("label");
-      label.htmlFor = `${group}-${index}`;
-      label.textContent = String(index + 1);
+    const input = document.createElement("input");
+    input.id = `${group}-${index}`;
+    input.type = "text";
+    input.inputMode = "numeric";
+    input.autocomplete = "off";
+    input.maxLength = 24;
+    input.placeholder = "e.g. 9085";
+    input.value = value;
+    input.setAttribute("aria-label", `${group === "pants" ? "Pant" : "Shirt"} ${index + 1} number`);
 
-      const input = document.createElement("input");
-      input.id = `${group}-${index}`;
-      input.type = "text";
-      input.inputMode = "numeric";
-      input.autocomplete = "off";
-      input.maxLength = 24;
-      input.placeholder = "e.g. 9085";
-      input.value = value;
-      input.setAttribute("aria-label", `${group === "pants" ? "Pant" : "Shirt"} ${index + 1} number`);
-      input.addEventListener("input", () => {
-        data[group][index] = input.value.slice(0, 24);
-        if (index === data[group].length - 1 && input.value.trim()) {
-          data[group].push("");
-          renderRows(group);
-          document.getElementById(`${group}-${index}`).focus();
-        }
-        updateMatches();
-        scheduleSave();
-      });
-      input.addEventListener("keydown", (event) => {
-        if (event.key !== "Enter") return;
-        event.preventDefault();
-        document.getElementById(`${group}-${index + 1}`)?.focus();
-      });
-
-      row.append(label, input);
-      container.append(row);
-    });
-  }
-
-  function updateMatches() {
-    const pants = data.pants.map((value) => value.trim());
-    const shirts = data.shirts.map((value) => value.trim());
-    const shirtSet = new Set(shirts.filter(Boolean));
-    const matches = new Set(pants.filter((value) => value && shirtSet.has(value)));
-
-    document.querySelectorAll(".item").forEach((row) => {
-      const value = data[row.dataset.group][Number(row.dataset.index)]?.trim();
-      row.classList.toggle("matched", Boolean(value && matches.has(value)));
+    input.addEventListener("input", () => {
+      data[group][index] = input.value.slice(0, 24);
+      if (index === data[group].length - 1 && input.value.trim()) {
+        data[group].push("");
+        renderRows(group);
+        document.getElementById(`${group}-${index}`).focus();
+      }
+      updateMatches();
+      scheduleSave();
     });
 
-    let count = 0;
-    const pairRows = [];
-    pants.forEach((pant, pantIndex) => {
-      if (!pant || !matches.has(pant)) return;
-      shirts.forEach((shirt, shirtIndex) => {
-        if (shirt !== pant) return;
-        count += 1;
-        pairRows.push(`<div class="pair"><span>Pant ${pantIndex + 1} ↔ Shirt ${shirtIndex + 1}</span><strong>${escapeHtml(pant)}</strong></div>`);
-      });
+    input.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter") return;
+      event.preventDefault();
+      document.getElementById(`${group}-${index + 1}`)?.focus();
     });
-    document.querySelector("#match-count").textContent = String(count);
-    const pairs = document.querySelector("#pairs");
-    pairs.className = pairRows.length ? "pairs" : "empty";
-    pairs.innerHTML = pairRows.length ? pairRows.join("") : "No matches yet. Matching numbers appear here.";
+
+    row.append(label, input);
+    container.append(row);
+  });
+}
+
+function matchedValues() {
+  const pants = data.pants.map((value) => value.trim());
+  const shirts = new Set(data.shirts.map((value) => value.trim()).filter(Boolean));
+  return new Set(pants.filter((value) => value && shirts.has(value)));
+}
+
+function updateMatches() {
+  const matches = matchedValues();
+  document.querySelectorAll(".item").forEach((row) => {
+    const value = data[row.dataset.group][Number(row.dataset.index)]?.trim();
+    row.classList.toggle("matched", Boolean(value && matches.has(value)));
+  });
+
+  const pairs = [];
+  data.pants.forEach((pant, pantIndex) => {
+    const code = pant.trim();
+    if (!code || !matches.has(code)) return;
+    data.shirts.forEach((shirt, shirtIndex) => {
+      if (shirt.trim() === code) {
+        pairs.push(`<div class="pair"><span>Pant ${pantIndex + 1} ↔ Shirt ${shirtIndex + 1}</span><strong>${escapeHtml(code)}</strong></div>`);
+      }
+    });
+  });
+
+  document.querySelector("#match-count").textContent = String(pairs.length);
+  const pairContainer = document.querySelector("#pairs");
+  pairContainer.className = pairs.length ? "pairs" : "empty";
+  pairContainer.innerHTML = pairs.length ? pairs.join("") : "No matches yet. Matching numbers appear here.";
+  document.querySelector("#pack-matches").disabled = matches.size === 0;
+}
+
+function scheduleSave() {
+  dirty = true;
+  setStatus("Unsaved changes", "pending");
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(saveNow, 500);
+}
+
+async function saveNow() {
+  if (!dirty || saving || !supabase) return;
+  saving = true;
+  const payload = snapshot();
+  const savedSnapshot = JSON.stringify(payload);
+  setStatus("Saving to cloud…", "pending");
+
+  const { error } = await supabase.from(TABLE).upsert({
+    id: ROW_ID,
+    pants: payload.pants,
+    shirts: payload.shirts,
+    updated_at: new Date().toISOString(),
+  }, { onConflict: "id" });
+
+  saving = false;
+  if (error) {
+    setStatus("Save failed — check connection and retry", "error");
+    console.error("Cloud save failed:", error.message);
+    return;
   }
 
-  function snapshot() {
-    return {
-      pants: data.pants.filter((value) => value.trim()),
-      shirts: data.shirts.filter((value) => value.trim()),
-    };
-  }
+  dirty = JSON.stringify(snapshot()) !== savedSnapshot;
+  setStatus(dirty ? "Saving latest changes…" : "Saved to cloud ✓", dirty ? "pending" : "saved");
+  if (dirty) saveNow();
+}
 
-  function scheduleSave() {
-    dirty = true;
-    setSaveState("Unsaved changes", "pending");
-    clearTimeout(saveTimer);
-    saveTimer = setTimeout(saveNow, 450);
-  }
+async function packMatches() {
+  const matches = matchedValues();
+  if (!matches.size) return;
+  const codes = [...matches];
+  const confirmed = window.confirm(
+    `Remove ${codes.length} matched code(s) from BOTH lists after packing?\n\n${codes.join(", ")}`
+  );
+  if (!confirmed) return;
 
-  async function saveNow() {
-    if (!dirty || saving) return;
-    saving = true;
-    const payload = snapshot();
-    const payloadSnapshot = JSON.stringify(payload);
-    setSaveState("Saving to cloud…", "pending");
-    const { error } = await supabase.from("matcher_data").upsert({
-      user_id: user.id,
-      pants: payload.pants,
-      shirts: payload.shirts,
-      updated_at: new Date().toISOString(),
-    }, { onConflict: "user_id" });
-    saving = false;
+  data.pants = normalizeRows(data.pants.filter((value) => !matches.has(value.trim())));
+  data.shirts = normalizeRows(data.shirts.filter((value) => !matches.has(value.trim())));
+  renderRows("pants");
+  renderRows("shirts");
+  updateMatches();
+  scheduleSave();
+}
 
-    if (error) {
-      setSaveState("Save failed — check connection and retry", "error");
-      console.error("Cloud save failed:", error.message);
-      return;
-    }
+async function clearAll() {
+  if (!window.confirm("Delete ALL pants and shirts from the shared cloud list? This affects everyone using this link.")) return;
+  data = { pants: [""], shirts: [""] };
+  renderRows("pants");
+  renderRows("shirts");
+  updateMatches();
+  scheduleSave();
+}
 
-    lastSavedSnapshot = payloadSnapshot;
-    dirty = JSON.stringify(snapshot()) !== payloadSnapshot;
-    setSaveState(dirty ? "Saving latest changes…" : "Saved to cloud ✓", dirty ? "pending" : "saved");
-    if (dirty) saveNow();
-  }
-
-  async function clearAll() {
-    if (!window.confirm("Clear all shirt and pant numbers from your cloud list?")) return;
-    clearTimeout(saveTimer);
-    data = { pants: [""], shirts: [""] };
-    renderRows("pants");
-    renderRows("shirts");
-    updateMatches();
-    scheduleSave();
-  }
-
+function bindActions() {
   document.querySelectorAll("[data-add]").forEach((button) => {
     button.addEventListener("click", () => {
       const group = button.dataset.add;
@@ -246,30 +241,53 @@ function renderMatcher(user, initialData) {
       document.getElementById(`${group}-${data[group].length - 1}`).focus();
     });
   });
+  document.querySelector("#pack-matches").addEventListener("click", packMatches);
   document.querySelector("#clear").addEventListener("click", clearAll);
-  document.querySelector("#signout").addEventListener("click", async () => {
-    await supabase.auth.signOut();
-  });
+}
 
-  renderRows("pants");
-  renderRows("shirts");
-  updateMatches();
-  setSaveState("Saved list loaded ✓", "saved");
+async function loadSharedData() {
+  if (!supabase) {
+    app.innerHTML = `<main class="auth-shell"><section class="auth-card">
+      <h1>Setup required</h1>
+      <p>Cloudflare is missing the build variables <code>VITE_SUPABASE_URL</code> and <code>VITE_SUPABASE_ANON_KEY</code>. Add them in Pages build settings, then redeploy.</p>
+    </section></main>`;
+    return;
+  }
 
-  // Keep multiple open devices in sync when another device saves.
-  remoteChannel = supabase.channel(`matcher-${user.id}`)
+  const { data: row, error } = await supabase
+    .from(TABLE)
+    .select("pants, shirts")
+    .eq("id", ROW_ID)
+    .maybeSingle();
+
+  if (error) {
+    app.innerHTML = `<main class="auth-shell"><section class="auth-card">
+      <h1>Could not load shared list</h1>
+      <p class="notice">${escapeHtml(error.message)}</p>
+      <button class="primary" onclick="location.reload()">Retry</button>
+    </section></main>`;
+    return;
+  }
+
+  data = row
+    ? { pants: normalizeRows(row.pants), shirts: normalizeRows(row.shirts) }
+    : { pants: [""], shirts: [""] };
+
+  render();
+  setStatus("Shared list loaded ✓", "saved");
+
+  // Keep open devices in sync. Ignore remote updates while this device has unsaved edits.
+  remoteChannel = supabase.channel("shared-matcher-updates")
     .on("postgres_changes", {
-      event: "*", schema: "public", table: "matcher_data", filter: `user_id=eq.${user.id}`,
+      event: "*", schema: "public", table: TABLE,
     }, (payload) => {
-      if (dirty || saving || !payload.new) return;
+      if (dirty || saving || !payload.new || payload.new.id !== ROW_ID) return;
       data = {
-        pants: normalizeRows(payload.new.pants || []),
-        shirts: normalizeRows(payload.new.shirts || []),
+        pants: normalizeRows(payload.new.pants),
+        shirts: normalizeRows(payload.new.shirts),
       };
-      renderRows("pants");
-      renderRows("shirts");
-      updateMatches();
-      setSaveState("Synced from another device ✓", "saved");
+      render();
+      setStatus("Synced from another device ✓", "saved");
     })
     .subscribe();
 
@@ -279,52 +297,4 @@ function renderMatcher(user, initialData) {
   });
 }
 
-async function start() {
-  if (!configured) {
-    app.innerHTML = `
-      <main class="auth-shell"><section class="auth-card">
-        <h1>Setup required</h1>
-        <p>Add your Supabase project URL and publishable/anon key to a <code>.env</code> file. Follow README.md.</p>
-      </section></main>`;
-    return;
-  }
-
-  const { data: { session }, error } = await supabase.auth.getSession();
-  if (error) {
-    renderLogin("Could not check your session. Refresh and try again.");
-    return;
-  }
-  if (session) {
-    await loadUserData(session.user);
-  } else {
-    renderLogin();
-  }
-
-  supabase.auth.onAuthStateChange((event, nextSession) => {
-    if (event === "SIGNED_IN" && nextSession) {
-      loadUserData(nextSession.user);
-    } else if (event === "SIGNED_OUT") {
-      renderLogin();
-    }
-  });
-}
-
-async function loadUserData(user) {
-  app.innerHTML = `<main class="auth-shell"><section class="auth-card"><h1>Loading your list…</h1></section></main>`;
-  const { data, error } = await supabase
-    .from("matcher_data")
-    .select("pants, shirts")
-    .eq("user_id", user.id)
-    .maybeSingle();
-
-  if (error) {
-    app.innerHTML = `<main class="auth-shell"><section class="auth-card">
-      <h1>Could not load your list</h1><p class="notice">${escapeHtml(error.message)}</p>
-      <button class="primary" onclick="location.reload()">Retry</button>
-    </section></main>`;
-    return;
-  }
-  renderMatcher(user, data);
-}
-
-start();
+loadSharedData();
